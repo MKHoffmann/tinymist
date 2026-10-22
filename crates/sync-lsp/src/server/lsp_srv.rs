@@ -374,6 +374,16 @@ where
 
     /// Handles an incoming notification.
     pub fn on_notification(&mut self, method: &str, params: JsonValue) -> LspResult<()> {
+        if method == notification::Cancel::METHOD {
+            let params: CancelParams = serde_json::from_value(params).map_err(invalid_params)?;
+            let id: RequestId = match params.id {
+                NumberOrString::Number(id) => id.into(),
+                NumberOrString::String(id) => id.into(),
+            };
+            self.client.cancel_lsp_request(id);
+            return Ok(());
+        }
+
         let handle = |s, method: &str, params: JsonValue| {
             let Some(handler) = self.notifications.get(method) else {
                 log::warn!("unhandled notification: {method}");

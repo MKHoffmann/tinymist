@@ -508,6 +508,17 @@ impl LspClient {
             .register(id.clone(), (method.to_owned(), received_at));
     }
 
+    /// Cancels an client2server request (`$/cancelRequest`).
+    ///
+    /// The request is answered with `RequestCanceled` right away, so its
+    /// eventual result is dropped, and its handler is skipped if it has not
+    /// started running yet (see [`Self::schedule_tail`]).
+    #[cfg(feature = "lsp")]
+    pub fn cancel_lsp_request(&self, id: RequestId) {
+        let canceled = resp_err(ErrorCode::RequestCanceled, "canceled by client");
+        self.respond_result(id, Err(canceled));
+    }
+
     fn respond_result(&self, id: RequestId, result: LspResult<JsonValue>) {
         let req_id = id.clone();
         let msg: Message = match (self.msg_kind, result) {
@@ -578,6 +589,13 @@ impl LspClient {
                 self.respond_result(req_id, result);
             }
             Ok(MaybeDone::Future(result)) => {
+                // The request was canceled before its handler got to run, so
+                // drop the handler (and the snapshot it holds) without
+                // running it.
+                if self.req_queue.lock().incoming.is_completed(&req_id) {
+                    log::debug!("skipped canceled request({req_id:?})");
+                    return;
+                }
                 self.respond_result(req_id, result.await);
             }
             Ok(MaybeDone::Gone) => {
@@ -938,5 +956,54 @@ fn resp_err(code: ErrorCode, msg: impl fmt::Display) -> ResponseError {
         code: code as i32,
         message: msg.to_string(),
         data: None,
+    }
+}
+
+#[cfg(all(test, feature = "lsp"))]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    #[test]
+    fn canceled_request_is_answered_once_and_not_run() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let conn = Connection::<LspMessage>::channel();
+        let root = LspClientRoot::new(runtime.handle().clone(), conn.sender);
+        let client = root.weak();
+
+        let id = RequestId::from(1);
+        client.register_request("textDocument/hover", &id, tinymist_std::time::now());
+
+        // The handler is scheduled but has not run when the cancellation arrives.
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_handler = ran.clone();
+        let resp: ScheduleResult = just_future(async move {
+            ran_in_handler.store(true, Ordering::SeqCst);
+            Ok(JsonValue::Null)
+        });
+
+        client.cancel_lsp_request(id.clone());
+        runtime.block_on(client.clone().schedule_tail(id.clone(), resp));
+
+        assert!(!ran.load(Ordering::SeqCst), "canceled handler must not run");
+        let Ok(Message::Lsp(lsp::Message::Response(resp))) = conn.receiver.lsp.try_recv() else {
+            panic!("expected a response to the canceled request");
+        };
+        assert_eq!(resp.id, id);
+        assert_eq!(
+            resp.error.map(|e| e.code),
+            Some(ErrorCode::RequestCanceled as i32)
+        );
+        assert!(
+            conn.receiver.lsp.try_recv().is_err(),
+            "the canceled request must be answered exactly once"
+        );
+
+        // Canceling an unknown or already answered request is a no-op.
+        client.cancel_lsp_request(id);
+        assert!(conn.receiver.lsp.try_recv().is_err());
     }
 }
